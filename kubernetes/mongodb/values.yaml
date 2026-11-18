@@ -1,0 +1,52 @@
+# Targil2026 - MongoDB Helm Configuration
+# Chart: bitnami/mongodb 16.5.45
+# MongoDB: 8.0.13
+
+global:
+  security:
+    allowInsecureImages: true
+
+architecture: standalone
+
+image:
+  registry: docker.io
+  repository: bitnamilegacy/mongodb
+  tag: 8.0.13-debian-12-r0
+
+auth:
+  enabled: true
+  existingSecret: mongodb-credentials
+
+persistence:
+  enabled: false
+
+service:
+  type: NodePort
+  ports:
+    mongodb: 27017
+  nodePorts:
+    mongodb: 32017
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+
+metrics:
+  enabled: true
+
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/mongodb-exporter
+    tag: 0.47.0-debian-12-r1
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
