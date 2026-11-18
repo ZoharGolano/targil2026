@@ -173,9 +173,9 @@ targil2026/
 │   └── mongodb/
 │       └── values.yaml            # Version-controlled Helm values; no passwords
 └── docs/
-    ├── 01-infrastructure-setup-he.md
-    ├── 02-k3s-ha-he.md
-    └── 03-mongodb-installation-he.md
+    ├── 01-infrastructure-setup.md
+    ├── 02-k3s-ha.md
+    └── 03-mongodb-installation.md
 ```
 
 Documentation availability depends on which files have been copied into the local Git checkout. The links below are intended repository paths; check files before committing.
@@ -200,9 +200,9 @@ Documentation availability depends on which files have been copied into the loca
 
 ## Documentation
 
-- [Infrastructure provisioning — Hebrew](docs/01-infrastructure-setup-he.md)
-- [K3s HA and etcd — Hebrew](docs/02-k3s-ha-he.md)
-- [MongoDB installation and troubleshooting — Hebrew](docs/03-mongodb-installation-he.md)
+- [Infrastructure provisioning — English](docs/01-infrastructure-setup.md)
+- [K3s HA and etcd — English](docs/02-k3s-ha.md)
+- [MongoDB installation and troubleshooting — English](docs/03-mongodb-installation.md)
 - [MongoDB Helm values](kubernetes/mongodb/values.yaml)
 
 > Progress is marked complete only where corresponding commands or observed results verified it. Updated: **2026-11-18**.
