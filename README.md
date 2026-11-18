@@ -4,7 +4,7 @@
 
 This project documents the design and implementation of a self-managed Kubernetes environment, followed by MongoDB, an application Helm chart, Argo CD GitOps deployment, and a security-gated CI/CD pipeline.
 
-**Current status (2026-11-18):** All three Ubuntu virtual machines (`k3s-node01`, `k3s-node02`, `k3s-node03`) are provisioned and validated. **K3s is not installed yet.** MongoDB, Argo CD, the application, and CI/CD are also not deployed.
+**Current status (2026-11-18):** All three Ubuntu VMs are provisioned and **K3s v1.37.2+k3s1 is installed and validated on all three nodes**. The embedded-etcd cluster has three healthy voting members; a manual snapshot was created; a controlled follower outage and recovery test passed. MongoDB, Argo CD, the application, and CI/CD are not yet deployed.
 
 ## Infrastructure design
 
@@ -12,8 +12,8 @@ This project documents the design and implementation of a self-managed Kubernete
 |---|---|---|
 | Virtualization | KVM / QEMU / libvirt | Linux-native VM management on a laptop |
 | Guest OS | Ubuntu Server 24.04 | LTS base image with Cloud-init support |
-| Kubernetes distribution | K3s (planned) | Lightweight self-managed Kubernetes for a local lab |
-| Nodes | Three VMs provisioned; combined control-plane, etcd and worker roles planned for K3s | Explore quorum, scheduling and node failures |
+| Kubernetes distribution | K3s v1.37.2+k3s1 (installed) | Lightweight self-managed Kubernetes for a local lab |
+| Nodes | Three VMs, all control-plane + etcd; also schedulable for workloads | Explore quorum, scheduling and node failures |
 | Node sizing | 2 vCPU, 5 GiB RAM | Fit three VMs into the available 32 GB laptop RAM |
 | Storage per VM | 25 GiB OS + 55 GiB `/var` | Isolate system and Kubernetes runtime data |
 | Network | libvirt default NAT, 192.168.122.0/24 | Reproducible local networking, outgoing internet access |
@@ -24,9 +24,9 @@ This project documents the design and implementation of a self-managed Kubernete
 
 | Host | IP | Role | State |
 |---|---|---|---|
-| `k3s-node01` | `192.168.122.11` | Control plane + etcd + worker (after K3s install) | VM provisioned; K3s preflight checked |
-| `k3s-node02` | `192.168.122.12` | Control plane + etcd + worker (planned) | VM provisioned; cloud-init done; `/var` verified |
-| `k3s-node03` | `192.168.122.13` | Control plane + etcd + worker (planned) | VM provisioned; cloud-init done; network checked |
+| `k3s-node01` | `192.168.122.11` | Control plane + etcd + schedulable | K3s Ready; initially etcd leader |
+| `k3s-node02` | `192.168.122.12` | Control plane + etcd + schedulable | K3s Ready; follower outage and recovery tested |
+| `k3s-node03` | `192.168.122.13` | Control plane + etcd + schedulable | K3s Ready; etcd health and snapshot tested |
 
 ## Completed work
 
@@ -40,7 +40,19 @@ This project documents the design and implementation of a self-managed Kubernete
 8. Verified node03 reaches node01 and node02 by ping with 0% packet loss; SSH active, interface `192.168.122.13/24`, gateway `192.168.122.1`.
 9. Checked node01 K3s preflight: 4.8 GiB RAM (4.4 GiB available at check), ~51 GiB free on `/var`, swap disabled, UFW inactive, and HTTP 200 from `get.k3s.io`.
 
-**Not completed:** The K3s installation and three-member etcd cluster. Do not confuse OS provisioning with Kubernetes readiness.
+## Completed Kubernetes HA milestone (2026-11-18)
+
+- Installed K3s `v1.37.2+k3s1` (containerd `2.3.7-k3s1`) on three nodes, each `Ready` with `control-plane,etcd` roles.
+- Verified API readiness (`readyz check passed`), three API endpoints in an EndpointSlice, and healthy core components: CoreDNS, Traefik, Metrics Server, local-path provisioner, and ServiceLB.
+- Verified embedded etcd `3.7.1` has **three started, voting members** with exactly one leader (node01 at time of check) and healthy endpoints on `.11`, `.12`, and `.13`.
+- Created manual etcd snapshot `pre-ha-test-k3s-node03-1795023370` (11,710,496 bytes, November 18, 2026, 17:36:10 UTC). **Restore not tested.**
+- Tested HA by stopping `k3s` on follower node02. Node02 became `NotReady`, while node03 API `/readyz` returned `ok` and both surviving etcd endpoints were healthy (quorum 2/3).
+- Restarted K3s on node02; all three nodes returned to `Ready` and all three etcd endpoints returned to `HEALTH=true`.
+
+**Not tested:** leader failure, application failover, snapshot restore, stable highly available Kubernetes API endpoint, or host-level redundancy. The three nodes share one physical laptop.
+
+**Not yet deployed:** MongoDB, Argo CD, workload Helm charts, GitHub Actions, SAST, Trivy, and GitOps.
+
 
 ## Troubleshooting and lessons learned
 
@@ -72,16 +84,18 @@ systemctl --failed
 
 ## Next milestones
 
-- Validate NTP/time, DNS, Kubernetes-required port connectivity and the selected pinned K3s version.
-- Deploy K3s with embedded etcd and establish a stable Kubernetes API endpoint.
+- Securely back up the original server token and copy etcd snapshots off-host; consider a separate restore drill.
+- Establish a stable HA Kubernetes API endpoint (VIP or load balancer) and update the required certificates/configuration.
+- Consider a controlled etcd leader-failure test after verifying backups and rollback procedures.
 - Deploy MongoDB 8.0.13 using a suitable Bitnami Helm chart, with explicit resource constraints and exporter metrics.
 - Deploy Argo CD, then build the application's Docker image and Helm chart.
 - Implement GitHub Actions with SAST, image vulnerability scanning and a HIGH-severity deployment gate, version bumping, and GitOps-based deployment.
 
 ## Documentation
 
-The updated Hebrew step-by-step infrastructure runbook, including the three VMs, provisioning scripts, troubleshooting, and verified preflight results, is located at:
+The Hebrew runbooks are:
 
-[`docs/01-infrastructure-setup-he.md`](docs/01-infrastructure-setup-he.md)
+- [`docs/01-infrastructure-setup-he.md`](docs/01-infrastructure-setup-he.md) — infrastructure, VM provisioning, disks, networking, troubleshooting.
+- [`docs/02-k3s-ha-he.md`](docs/02-k3s-ha-he.md) — K3s installation, etcd snapshots, quorum checks, controlled HA outage and recovery.
 
 > This README reflects work completed to date. Any future changes must be validated and documented before being marked as complete.
