@@ -2,100 +2,207 @@
 
 ## Project overview
 
-This project documents the design and implementation of a self-managed Kubernetes environment, followed by MongoDB, an application Helm chart, Argo CD GitOps deployment, and a security-gated CI/CD pipeline.
+This project documents the design, implementation, and validation of a self-managed Kubernetes environment, followed by MongoDB, an application Helm chart, Argo CD GitOps deployment, and a security-gated CI/CD pipeline. The goal is to learn by building, testing failures, and documenting operational decisions and troubleshooting.
 
-**Current status (2026-11-18):** All three Ubuntu VMs are provisioned and **K3s v1.37.2+k3s1 is installed and validated on all three nodes**. The embedded-etcd cluster has three healthy voting members; a manual snapshot was created; a controlled follower outage and recovery test passed. MongoDB, Argo CD, the application, and CI/CD are not yet deployed.
+**Current status (2026-11-18):** All three Ubuntu virtual machines are provisioned. A three-server K3s cluster with embedded etcd is running, and a one-node K3s outage/recovery test succeeded. **MongoDB 8.0.13 is deployed and validated** using a pinned Bitnami Helm chart. The application, Argo CD, and CI/CD pipeline remain to be implemented.
+
+> **Lab only:** All virtual machines share one physical laptop, so the infrastructure is not physically highly available. MongoDB runs as a single standalone instance with persistence disabled. The deployment uses legacy container images without ongoing security updates and must not be treated as production-ready.
 
 ## Infrastructure design
 
-| Component | Selected design | Rationale |
+| Component | Implemented design | Rationale |
 |---|---|---|
 | Virtualization | KVM / QEMU / libvirt | Linux-native VM management on a laptop |
 | Guest OS | Ubuntu Server 24.04 | LTS base image with Cloud-init support |
-| Kubernetes distribution | K3s v1.37.2+k3s1 (installed) | Lightweight self-managed Kubernetes for a local lab |
-| Nodes | Three VMs, all control-plane + etcd; also schedulable for workloads | Explore quorum, scheduling and node failures |
-| Node sizing | 2 vCPU, 5 GiB RAM | Fit three VMs into the available 32 GB laptop RAM |
+| Kubernetes distribution | K3s `v1.37.2+k3s1` | Lightweight, self-managed Kubernetes for a local lab |
+| Cluster topology | Three K3s servers, each running control-plane, embedded etcd, and worker roles | Explore quorum, scheduling, and node failures |
+| Node sizing | 2 vCPU, 5120 MiB RAM per VM | Fit three VMs into the available 32 GB laptop RAM |
 | Storage per VM | 25 GiB OS + 55 GiB `/var` | Isolate system and Kubernetes runtime data |
-| Network | libvirt default NAT, 192.168.122.0/24 | Reproducible local networking, outgoing internet access |
-| IP assignment | DHCP reservations by MAC | Stable per-node IPs without configuring static addresses in the guest |
+| Network | libvirt default NAT, `192.168.122.0/24` | Reproducible local networking and outgoing internet access |
+| IP assignment | DHCP reservations by MAC address | Stable per-node IPs without guest static-IP configuration |
 | Provisioning | Ubuntu Cloud Image + Cloud-init | Repeatable VM initialization |
+| Database | MongoDB `8.0.13`, standalone, no persistent volume | Meet the exercise requirements; intentionally ephemeral |
+| Database deployment | Helm `bitnami/mongodb` chart `16.5.45` | Reproducible, pinned installation |
 
-### Planned hosts
+### Hosts
 
-| Host | IP | Role | State |
+| Host | IP | Kubernetes roles | Status |
 |---|---|---|---|
-| `k3s-node01` | `192.168.122.11` | Control plane + etcd + schedulable | K3s Ready; initially etcd leader |
-| `k3s-node02` | `192.168.122.12` | Control plane + etcd + schedulable | K3s Ready; follower outage and recovery tested |
-| `k3s-node03` | `192.168.122.13` | Control plane + etcd + schedulable | K3s Ready; etcd health and snapshot tested |
+| `k3s-node01` | `192.168.122.11` | Control plane + etcd + worker | Ready |
+| `k3s-node02` | `192.168.122.12` | Control plane + etcd + worker | Ready; outage/recovery tested |
+| `k3s-node03` | `192.168.122.13` | Control plane + etcd + worker | Ready; hosts the MongoDB pod at last verification |
+
+### Current deployment architecture
+
+```text
+Ubuntu laptop — KVM / libvirt NAT (192.168.122.0/24)
+│
+├── k3s-node01  192.168.122.11 ─┐
+├── k3s-node02  192.168.122.12 ─┼── K3s HA control plane / embedded etcd (3 members)
+└── k3s-node03  192.168.122.13 ─┘
+           │
+           └── Namespace: mongodb
+               ├── MongoDB 8.0.13 (standalone; one pod)
+               │   └── Service: NodePort 32017 → TCP 27017
+               └── MongoDB Exporter (sidecar)
+                   └── Service: ClusterIP TCP 9216 → /metrics
+```
+
+The configured MongoDB Service has `externalTrafficPolicy: Local`. At the time of testing, the MongoDB pod was on `k3s-node03`, so the host-side TCP test targeted `192.168.122.13:32017`. That address may need to change if the pod is rescheduled.
 
 ## Completed work
 
-1. Verified laptop hardware, VT-x/KVM, QEMU/libvirt, and available capacity; resolved libvirt socket permissions.
+### 1. VM infrastructure
+
+1. Verified laptop hardware, VT-x/KVM, QEMU/libvirt, and capacity; resolved libvirt socket permissions.
 2. Configured libvirt `default` NAT (`192.168.122.0/24`) and DHCP reservations for `.11`, `.12`, and `.13` with unique MAC addresses.
-3. Downloaded Ubuntu 24.04 Cloud Image; provisioned all three VMs with Cloud-init, SSH keys, 2 vCPU and 5120 MiB RAM each.
+3. Provisioned three Ubuntu 24.04 virtual machines with Cloud-init, SSH keys, 2 vCPU, and 5120 MiB RAM each.
 4. Created two QCOW2 disks per VM: 25 GiB OS and 55 GiB dedicated ext4 `/var`.
-5. Migrated `/var` offline preserving ACLs/xattrs; created `create-vm-disks.sh` and `prepare-var-disk.sh` to automate node02 and node03 storage provisioning.
-6. Diagnosed temporary `umount: target is busy` errors, enhanced cleanup with bounded retries, and confirmed both NBD devices were detached (`0B`).
-7. Verified node02 and node03 booted with cloud-init `done`, no reported errors, root filesystem expanded, `/var` on `/dev/vdb`, and zero failed systemd units.
-8. Verified node03 reaches node01 and node02 by ping with 0% packet loss; SSH active, interface `192.168.122.13/24`, gateway `192.168.122.1`.
-9. Checked node01 K3s preflight: 4.8 GiB RAM (4.4 GiB available at check), ~51 GiB free on `/var`, swap disabled, UFW inactive, and HTTP 200 from `get.k3s.io`.
+5. Migrated `/var` offline while preserving ownership, ACLs, and extended attributes; added `create-vm-disks.sh` and `prepare-var-disk.sh` provisioning scripts.
+6. Diagnosed transient `umount: target is busy` errors, improved bounded-retry cleanup, and verified the disk mounts and boot process.
+7. Verified network connectivity, cloud-init completion, disk layout, and system service health.
 
-## Completed Kubernetes HA milestone (2026-11-18)
+### 2. K3s and embedded etcd
 
-- Installed K3s `v1.37.2+k3s1` (containerd `2.3.7-k3s1`) on three nodes, each `Ready` with `control-plane,etcd` roles.
-- Verified API readiness (`readyz check passed`), three API endpoints in an EndpointSlice, and healthy core components: CoreDNS, Traefik, Metrics Server, local-path provisioner, and ServiceLB.
-- Verified embedded etcd `3.7.1` has **three started, voting members** with exactly one leader (node01 at time of check) and healthy endpoints on `.11`, `.12`, and `.13`.
-- Created manual etcd snapshot `pre-ha-test-k3s-node03-1795023370` (11,710,496 bytes, November 18, 2026, 17:36:10 UTC). **Restore not tested.**
-- Tested HA by stopping `k3s` on follower node02. Node02 became `NotReady`, while node03 API `/readyz` returned `ok` and both surviving etcd endpoints were healthy (quorum 2/3).
-- Restarted K3s on node02; all three nodes returned to `Ready` and all three etcd endpoints returned to `HEALTH=true`.
+1. Installed pinned K3s `v1.37.2+k3s1` on all three servers; `k3s-node01` initialized embedded etcd, and nodes 02/03 joined as additional servers.
+2. Confirmed all nodes were `Ready` and running the combined `control-plane,etcd` roles.
+3. Verified Kubernetes API readiness and all three etcd members using `etcdctl member list`, `endpoint status --cluster`, and `endpoint health --cluster`.
+4. Saved a pre-test etcd snapshot on `k3s-node03`.
+5. Stopped K3s on `k3s-node02`: the node became `NotReady`, but the Kubernetes API and the remaining two etcd endpoints stayed healthy (2/3 quorum).
+6. Restarted K3s on `k3s-node02` and confirmed all nodes returned to `Ready` and all three etcd endpoints were healthy.
 
-**Not tested:** leader failure, application failover, snapshot restore, stable highly available Kubernetes API endpoint, or host-level redundancy. The three nodes share one physical laptop.
+**HA limitation:** This demonstrates tolerance of a single K3s server outage, not tolerance of losing the common physical laptop. A separate etcd-leader failure scenario was not tested.
 
-**Not yet deployed:** MongoDB, Argo CD, workload Helm charts, GitHub Actions, SAST, Trivy, and GitOps.
+### 3. MongoDB with Helm
 
+1. Installed Helm `v3.22.1` and pinned Bitnami MongoDB chart `16.5.45` (application version `8.0.13`).
+2. Created the `mongodb` namespace and a Kubernetes Secret, `mongodb-credentials`, containing the `mongodb-root-password` key. The password itself is **not stored in Git**.
+3. Created [`kubernetes/mongodb/values.yaml`](kubernetes/mongodb/values.yaml) with standalone architecture, authentication, explicit requests/limits, disabled persistence, NodePort `32017`, and enabled exporter metrics.
+4. Used `helm template` to inspect the generated Deployment, Services, NetworkPolicy, and other resources before installation.
+5. Installed MongoDB successfully; Helm release `mongodb` reached `deployed` and its pod reached `2/2 Running` with zero restarts at verification time.
+6. Confirmed the running database reports **`db version v8.0.13`** with `mongod --version`.
+7. Authenticated with `mongosh` and successfully ran `db.adminCommand({ping: 1})`, receiving `{ ok: 1 }`.
+8. Tested NodePort reachability from the laptop with `nc -vz -w 5 192.168.122.13 32017`; the TCP connection succeeded.
+9. Queried exporter `/metrics` through `kubectl port-forward` and observed `mongodb_up{cluster_role="mongod"} 1`.
+10. Confirmed container resource configuration, measured live CPU/memory usage, and verified that no PVC exists in the `mongodb` namespace.
+
+### MongoDB configuration and verification
+
+| Parameter | Verified result |
+|---|---|
+| Chart / release | `bitnami/mongodb` `16.5.45` / `mongodb` |
+| MongoDB version | `8.0.13` (verified inside the container) |
+| Namespace | `mongodb` |
+| Architecture | Standalone |
+| Authentication | Root authentication succeeded; password referenced via Kubernetes Secret |
+| MongoDB Service | `NodePort`, `27017:32017/TCP` |
+| Metrics Service | `ClusterIP`, `9216/TCP` |
+| Exporter health | `mongodb_up{cluster_role="mongod"} 1` |
+| Persistence | Disabled; no PVC found |
+| MongoDB requests | `250m` CPU; `512Mi` memory |
+| MongoDB limits | `1` CPU; `2Gi` memory |
+| Exporter requests | `50m` CPU; `64Mi` memory |
+| Exporter limits | `200m` CPU; `256Mi` memory |
+| Observed MongoDB usage | `90m` CPU; `89Mi` memory (point-in-time sample) |
+| Observed exporter usage | `1m` CPU; `11Mi` memory (point-in-time sample) |
+
+**Metrics scope:** The exporter is healthy and serving Prometheus-format metrics. Automatic collection by a Prometheus server has **not** yet been verified.
 
 ## Troubleshooting and lessons learned
 
 **Libvirt permissions:** A regular user could not access the `root:libvirt` Unix socket, although `sudo virsh` worked. Group permissions were updated and access revalidated.
 
-**ACL preservation:** `rsync -aHAX` over guestmount reported `set_acl: Invalid argument` for systemd journal paths. Using direct ext4 mounts via qemu-nbd allowed the transfer to complete without reported errors. This illustrates the need to preserve ACLs, xattrs, ownership and hard links during system-directory migration.
+**ACL preservation:** `rsync -aHAX` over guestmount reported `set_acl: Invalid argument` for systemd journal paths. Direct ext4 mounts via qemu-nbd allowed the transfer to complete without reported errors.
 
-**Idempotency:** Repeating `tee -a` appended a duplicate `/var` entry to node01 `fstab`. It was removed. The new `prepare-var-disk.sh` performs safety checks but is **initial-provisioning-only**, not a fully idempotent script. Do not rerun on prepared disks.
+**Idempotency:** Repeating `tee -a` appended a duplicate `/var` entry to node01 `fstab`; it was removed. `prepare-var-disk.sh` is for initial provisioning and must not be rerun on already-prepared disks without review.
 
-**Disk safety:** QCOW2 images must not be edited simultaneously by the guest and the host. The guest was shut down and filesystems unmounted before block-device access. Disk identifiers were checked before formatting.
+**Disk safety:** QCOW2 images were edited only when guests were shut down and the relevant filesystems were unmounted. Disk identifiers were checked before formatting.
 
-**Transient unmount failure:** On node02, copying and fstab updates completed but cleanup returned `target is busy`; after inspection, manual unmount and NBD disconnect succeeded. On node03, bounded retry succeeded on the third unmount attempt. Exact root cause was not established.
+**Transient unmount failure:** On node02, copying and fstab updates completed but cleanup returned `target is busy`; manual cleanup succeeded. On node03, a bounded retry succeeded on the third attempt. The exact cause was not established.
+
+**Helm repository under `sudo`:** `helm install` initially failed with `repo bitnami not found` because the repository was registered under the regular user while installation ran as root. Running `sudo helm repo add bitnami https://charts.bitnami.com/bitnami` and `sudo helm repo update` resolved it.
+
+**MongoDB file-based credentials:** An initial `mongosh` login failed because `MONGODB_ROOT_PASSWORD` was not set inside the container. The chart instead provided `MONGODB_ROOT_PASSWORD_FILE`; reading the password from the mounted secret file allowed successful authentication. Do not print or commit secret values.
+
+**Network policy and NodePort:** The rendered NetworkPolicy allows ingress to ports `27017` and `9216` without source restrictions. It is not an effective source-IP allowlist; access must be controlled through the surrounding network/firewall and other suitable measures. A successful `nc` connection validates TCP reachability only, not MongoDB authentication.
+
+**Legacy Bitnami images:** The lab uses `docker.io/bitnamilegacy/mongodb:8.0.13-debian-12-r0` and `docker.io/bitnamilegacy/mongodb-exporter:0.47.0-debian-12-r1`. These legacy images do not receive normal security maintenance. `global.security.allowInsecureImages: true` bypasses the chart's original image verification; this is a lab-only compromise.
 
 ## Validation commands
 
 ```bash
-# On the laptop
+# On the Ubuntu laptop
 virsh -c qemu:///system list --all
 virsh -c qemu:///system net-dhcp-leases default
+nc -vz -w 5 192.168.122.13 32017
 
-# On k3s-node01
-hostname
-cloud-init status --long
-lsblk -f
-findmnt /var
-df -h /var
-systemctl --failed
+# On a K3s server
+sudo k3s kubectl get nodes -o wide
+sudo k3s kubectl get pods -A
+sudo k3s kubectl get pods,svc -n mongodb -o wide
+sudo k3s kubectl -n mongodb exec deploy/mongodb -c mongodb -- mongod --version
+sudo k3s kubectl top pod -n mongodb --containers
+sudo k3s kubectl get pvc -n mongodb
+sudo env KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm list -n mongodb
+
+# Authenticated MongoDB ping: password is read from a mounted Secret file.
+# Note: using --password exposes the value briefly in the mongosh process arguments.
+sudo k3s kubectl -n mongodb exec deploy/mongodb -c mongodb -- bash -c '
+  mongosh --quiet --host 127.0.0.1 \
+    --username "$MONGODB_ROOT_USER" \
+    --password "$(cat "$MONGODB_ROOT_PASSWORD_FILE")" \
+    --authenticationDatabase admin \
+    --eval "db.adminCommand({ping: 1})"
+'
+
+# In one terminal on the K3s server:
+sudo k3s kubectl -n mongodb port-forward svc/mongodb-metrics 9216:9216
+
+# In another terminal on the same server:
+curl -fsS http://127.0.0.1:9216/metrics | grep '^mongodb_up'
 ```
+
+## Repository layout
+
+```text
+targil2026/
+├── README.md
+├── infrastructure/
+│   └── kvm/                       # VM setup, cloud-init, disk preparation scripts
+├── kubernetes/
+│   └── mongodb/
+│       └── values.yaml            # Version-controlled Helm values; no passwords
+└── docs/
+    ├── 01-infrastructure-setup-he.md
+    ├── 02-k3s-ha-he.md
+    └── 03-mongodb-installation-he.md
+```
+
+Documentation availability depends on which files have been copied into the local Git checkout. The links below are intended repository paths; check files before committing.
+
+## Security and operational limitations
+
+- Never commit Kubernetes Secrets, passwords, private SSH keys, the K3s `server-token`, admin kubeconfigs, or credentials to Git.
+- MongoDB authentication is enabled, but the NodePort is reachable within the permitted lab network; the rendered NetworkPolicy does not restrict source IPs.
+- MongoDB has **no persistent volume**, so data can be lost when its pod is replaced or rescheduled.
+- MongoDB runs as **standalone**, not a replica set; K3s quorum does not provide database HA.
+- All three VMs are on one physical host, creating a single point of failure.
+- Legacy Bitnami images and disabled image-origin verification are not suitable defaults for production.
+- Pod names, IP addresses, and measured resource consumption may change between runs.
 
 ## Next milestones
 
-- Securely back up the original server token and copy etcd snapshots off-host; consider a separate restore drill.
-- Establish a stable HA Kubernetes API endpoint (VIP or load balancer) and update the required certificates/configuration.
-- Consider a controlled etcd leader-failure test after verifying backups and rollback procedures.
-- Deploy MongoDB 8.0.13 using a suitable Bitnami Helm chart, with explicit resource constraints and exporter metrics.
-- Deploy Argo CD, then build the application's Docker image and Helm chart.
-- Implement GitHub Actions with SAST, image vulnerability scanning and a HIGH-severity deployment gate, version bumping, and GitOps-based deployment.
+1. Ensure this README, the MongoDB values file, and the step-by-step documentation are tracked in the main Git repository, then push safely to GitHub.
+2. Fork or prepare the exercise application, build its Docker image, and deploy it with an application Helm chart.
+3. Install Argo CD and configure GitOps to reconcile application manifests from Git.
+4. Create GitHub Actions workflows for SAST, Trivy image vulnerability scans, and a HIGH-severity gate before publishing/deploying images.
+5. Document and validate the end-to-end change, build, scan, publish, and GitOps deployment workflow.
 
 ## Documentation
 
-The Hebrew runbooks are:
+- [Infrastructure provisioning — Hebrew](docs/01-infrastructure-setup-he.md)
+- [K3s HA and etcd — Hebrew](docs/02-k3s-ha-he.md)
+- [MongoDB installation and troubleshooting — Hebrew](docs/03-mongodb-installation-he.md)
+- [MongoDB Helm values](kubernetes/mongodb/values.yaml)
 
-- [`docs/01-infrastructure-setup-he.md`](docs/01-infrastructure-setup-he.md) — infrastructure, VM provisioning, disks, networking, troubleshooting.
-- [`docs/02-k3s-ha-he.md`](docs/02-k3s-ha-he.md) — K3s installation, etcd snapshots, quorum checks, controlled HA outage and recovery.
-
-> This README reflects work completed to date. Any future changes must be validated and documented before being marked as complete.
+> Progress is marked complete only where corresponding commands or observed results verified it. Updated: **2026-11-18**.

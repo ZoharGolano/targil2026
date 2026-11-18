@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ==========================================
+# Targil2026 - Prepare /var Disk
+# ==========================================
+
+VM_NAME="${1:-}"
+
+IMAGE_DIR="/var/lib/libvirt/images"
+
+OS_DISK="${IMAGE_DIR}/${VM_NAME}.qcow2"
+VAR_DISK="${IMAGE_DIR}/${VM_NAME}-var.qcow2"
+
+NBD_OS="/dev/nbd0"
+NBD_VAR="/dev/nbd1"
+
+MNT_OS=""
+MNT_VAR=""
+
+OS_CONNECTED=false
+VAR_CONNECTED=false
+
+# ------------------------------------------
+# Cleanup
+# ------------------------------------------
+
+cleanup() {
+    local status=$?
+
+    trap - EXIT
+
+    set +e
+
+    echo "Cleaning up..."
+
+    local safe_to_disconnect=true
+
+    if [[ -n "$MNT_VAR" ]] && mountpoint -q "$MNT_VAR"; then
+        umount "$MNT_VAR" || safe_to_disconnect=false
+    fi
+
+    if [[ -n "$MNT_OS" ]] && mountpoint -q "$MNT_OS"; then
+        umount "$MNT_OS" || safe_to_disconnect=false
+    fi
+
+    if [[ "$safe_to_disconnect" == true ]]; then
+        if [[ "$VAR_CONNECTED" == true ]]; then
+            qemu-nbd --disconnect "$NBD_VAR" || status=1
+        fi
+
+        if [[ "$OS_CONNECTED" == true ]]; then
+            qemu-nbd --disconnect "$NBD_OS" || status=1
+        fi
+    else
+        echo "ERROR: A filesystem is still mounted."
+        echo "NBD devices were not disconnected."
+        status=1
+    fi
+
+    if [[ -n "$MNT_OS" && -n "$MNT_VAR" ]]; then
+        rmdir "$MNT_OS" "$MNT_VAR" 2>/dev/null || true
+    fi
+
+    if [[ $status -eq 0 ]]; then
+        echo "Preparation completed successfully."
+    else
+        echo "Preparation failed. Inspect disks before retrying."
+    fi
+
+    exit "$status"
+}
+
+# ------------------------------------------
+# Validate input and environment
+# ------------------------------------------
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Run this script with sudo."
+    exit 1
+fi
+
+if [[ ! "$VM_NAME" =~ ^k3s-node0[23]$ ]]; then
+    echo "Usage: sudo $0 k3s-node02|k3s-node03"
+    exit 1
+fi
+
+for cmd in qemu-nbd lsblk blkid wipefs mkfs.ext4 \
+           mount umount rsync virsh partprobe \
+           udevadm mountpoint findmnt; do
+    if ! command -v "$cmd" >/dev/null; then
+        echo "ERROR: Missing command: $cmd"
+        exit 1
+    fi
+done
+
+if [[ ! -f "$OS_DISK" || ! -f "$VAR_DISK" ]]; then
+    echo "ERROR: VM disks not found."
+    exit 1
+fi
+
+# This script is intended for new VMs only.
+if virsh -c qemu:///system dominfo "$VM_NAME" &>/dev/null; then
+    echo "ERROR: VM already exists in libvirt."
+    exit 1
+fi
+
+# NBD devices must not be connected or mounted.
+for dev in nbd0 nbd1; do
+    if [[ -s "/sys/class/block/$dev/pid" ]]; then
+        echo "ERROR: $dev is already connected."
+        exit 1
+    fi
+
+    if [[ "$(cat "/sys/class/block/$dev/size")" != "0" ]]; then
+        echo "ERROR: $dev is not empty."
+        exit 1
+    fi
+done
+
+MNT_OS="$(mktemp -d /mnt/targil-os.XXXXXX)"
+MNT_VAR="$(mktemp -d /mnt/targil-var.XXXXXX)"
+
+trap cleanup EXIT
+
+echo "Preparing storage for $VM_NAME"
+
+# ------------------------------------------
+# Connect QCOW2 disks
+# ------------------------------------------
+
+echo "Connecting OS disk..."
+
+qemu-nbd --connect="$NBD_OS" \
+    --format=qcow2 "$OS_DISK"
+
+OS_CONNECTED=true
+
+partprobe "$NBD_OS"
+udevadm settle
+
+echo "Connecting VAR disk..."
+
+qemu-nbd --connect="$NBD_VAR" \
+    --format=qcow2 "$VAR_DISK"
+
+VAR_CONNECTED=true
+
+udevadm settle
+
+# ------------------------------------------
+# Validate disk identity and contents
+# ------------------------------------------
+
+if [[ ! -b /dev/nbd0p1 ]]; then
+    echo "ERROR: OS root partition not found."
+    exit 1
+fi
+
+if [[ "$(blkid -s TYPE -o value /dev/nbd0p1)" != "ext4" ]]; then
+    echo "ERROR: Unexpected OS filesystem."
+    exit 1
+fi
+
+if [[ "$(lsblk -n -o SIZE "$NBD_VAR" | xargs)" != "55G" ]]; then
+    echo "ERROR: Unexpected VAR disk size."
+    exit 1
+fi
+
+if [[ -n "$(wipefs -n "$NBD_VAR")" ]]; then
+    echo "ERROR: VAR disk already contains filesystem signatures."
+    exit 1
+fi
+
+if lsblk -nr -o TYPE "$NBD_VAR" | grep -q '^part$'; then
+    echo "ERROR: VAR disk contains partitions."
+    exit 1
+fi
+
+# ------------------------------------------
+# Mount OS filesystem read-only
+# ------------------------------------------
+
+mount -o ro,noload /dev/nbd0p1 "$MNT_OS"
+
+if [[ ! -d "$MNT_OS/var/lib" ||
+      ! -f "$MNT_OS/etc/fstab" ]]; then
+    echo "ERROR: Unexpected OS disk layout."
+    exit 1
+fi
+
+if awk '$1 !~ /^#/ && $2 == "/var" {found=1}
+        END {exit !found}' "$MNT_OS/etc/fstab"; then
+    echo "ERROR: /var already exists in fstab."
+    exit 1
+fi
+
+# ------------------------------------------
+# Format VAR disk
+# ------------------------------------------
+
+echo "Creating ext4 filesystem..."
+
+mkfs.ext4 -L "${VM_NAME}-var" "$NBD_VAR"
+
+mount "$NBD_VAR" "$MNT_VAR"
+
+# ------------------------------------------
+# Copy original /var
+# ------------------------------------------
+
+echo "Copying /var data..."
+
+rsync -aHAX --numeric-ids --one-file-system \
+    "$MNT_OS/var/" \
+    "$MNT_VAR/"
+
+echo "Verifying copied data..."
+
+VERIFY_OUTPUT="$(rsync -aHAXnc \
+    --numeric-ids \
+    --one-file-system \
+    --itemize-changes \
+    "$MNT_OS/var/" \
+    "$MNT_VAR/")"
+
+if [[ -n "$VERIFY_OUTPUT" ]]; then
+    echo "$VERIFY_OUTPUT"
+    echo "ERROR: Verification detected differences."
+    exit 1
+fi
+
+echo "Data verification successful."
+
+# ------------------------------------------
+# Update fstab
+# ------------------------------------------
+
+VAR_UUID="$(blkid -s UUID -o value "$NBD_VAR")"
+
+if [[ -z "$VAR_UUID" ]]; then
+    echo "ERROR: Could not obtain VAR UUID."
+    exit 1
+fi
+
+echo "Updating fstab..."
+
+umount "$MNT_OS"
+
+mount -o rw /dev/nbd0p1 "$MNT_OS"
+
+cp -a "$MNT_OS/etc/fstab" \
+      "$MNT_OS/etc/fstab.bak"
+
+printf 'UUID=%s /var ext4 defaults 0 2\n' \
+    "$VAR_UUID" >> "$MNT_OS/etc/fstab"
+
+echo "New fstab entry:"
+
+grep ' /var ' "$MNT_OS/etc/fstab"
+
+sync
