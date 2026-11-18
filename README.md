@@ -4,7 +4,7 @@
 
 This project documents the design and implementation of a self-managed Kubernetes environment, followed by MongoDB, an application Helm chart, Argo CD GitOps deployment, and a security-gated CI/CD pipeline.
 
-**Current status:** The first Ubuntu virtual machine (`k3s-node01`) is provisioned and validated. Kubernetes, the database, Argo CD, the application, and CI/CD are **not yet deployed**.
+**Current status (2026-11-18):** All three Ubuntu virtual machines (`k3s-node01`, `k3s-node02`, `k3s-node03`) are provisioned and validated. **K3s is not installed yet.** MongoDB, Argo CD, the application, and CI/CD are also not deployed.
 
 ## Infrastructure design
 
@@ -13,7 +13,7 @@ This project documents the design and implementation of a self-managed Kubernete
 | Virtualization | KVM / QEMU / libvirt | Linux-native VM management on a laptop |
 | Guest OS | Ubuntu Server 24.04 | LTS base image with Cloud-init support |
 | Kubernetes distribution | K3s (planned) | Lightweight self-managed Kubernetes for a local lab |
-| Nodes | Three combined control-plane, etcd and worker nodes (planned) | Explore quorum, scheduling and node failures |
+| Nodes | Three VMs provisioned; combined control-plane, etcd and worker roles planned for K3s | Explore quorum, scheduling and node failures |
 | Node sizing | 2 vCPU, 5 GiB RAM | Fit three VMs into the available 32 GB laptop RAM |
 | Storage per VM | 25 GiB OS + 55 GiB `/var` | Isolate system and Kubernetes runtime data |
 | Network | libvirt default NAT, 192.168.122.0/24 | Reproducible local networking, outgoing internet access |
@@ -24,20 +24,23 @@ This project documents the design and implementation of a self-managed Kubernete
 
 | Host | IP | Role | State |
 |---|---|---|---|
-| `k3s-node01` | `192.168.122.11` | Control plane + etcd + worker (after K3s install) | VM created and storage configured |
-| `k3s-node02` | `192.168.122.12` | Control plane + etcd + worker | Not created |
-| `k3s-node03` | `192.168.122.13` | Control plane + etcd + worker | Not created |
+| `k3s-node01` | `192.168.122.11` | Control plane + etcd + worker (after K3s install) | VM provisioned; K3s preflight checked |
+| `k3s-node02` | `192.168.122.12` | Control plane + etcd + worker (planned) | VM provisioned; cloud-init done; `/var` verified |
+| `k3s-node03` | `192.168.122.13` | Control plane + etcd + worker (planned) | VM provisioned; cloud-init done; network checked |
 
 ## Completed work
 
-1. Verified laptop hardware, virtualization support, available memory and disk space.
-2. Confirmed KVM/QEMU and libvirt availability; resolved the libvirt socket permission issue by assigning the operator to the required groups.
-3. Verified libvirt NAT networking, then configured and validated a MAC-to-IP DHCP reservation for `k3s-node01`.
-4. Downloaded the Ubuntu 24.04 Cloud Image and created independent QCOW2 OS and data disks.
-5. Provisioned `k3s-node01` with Cloud-init and SSH-key authentication; validated boot, hostname, DHCP and storage discovery.
-6. Formatted a dedicated 55 GiB ext4 filesystem for `/var`.
-7. Migrated `/var` offline. The initial FUSE/guestmount-based rsync hit ACL errors (exit code 23), so the disks were reattached through qemu-nbd and rsync completed successfully (exit code 0).
-8. Verified migration, backed up `fstab`, configured `/var` by filesystem UUID, removed a duplicate fstab entry, and rebooted the guest. The post-boot storage and service checks were reported successful.
+1. Verified laptop hardware, VT-x/KVM, QEMU/libvirt, and available capacity; resolved libvirt socket permissions.
+2. Configured libvirt `default` NAT (`192.168.122.0/24`) and DHCP reservations for `.11`, `.12`, and `.13` with unique MAC addresses.
+3. Downloaded Ubuntu 24.04 Cloud Image; provisioned all three VMs with Cloud-init, SSH keys, 2 vCPU and 5120 MiB RAM each.
+4. Created two QCOW2 disks per VM: 25 GiB OS and 55 GiB dedicated ext4 `/var`.
+5. Migrated `/var` offline preserving ACLs/xattrs; created `create-vm-disks.sh` and `prepare-var-disk.sh` to automate node02 and node03 storage provisioning.
+6. Diagnosed temporary `umount: target is busy` errors, enhanced cleanup with bounded retries, and confirmed both NBD devices were detached (`0B`).
+7. Verified node02 and node03 booted with cloud-init `done`, no reported errors, root filesystem expanded, `/var` on `/dev/vdb`, and zero failed systemd units.
+8. Verified node03 reaches node01 and node02 by ping with 0% packet loss; SSH active, interface `192.168.122.13/24`, gateway `192.168.122.1`.
+9. Checked node01 K3s preflight: 4.8 GiB RAM (4.4 GiB available at check), ~51 GiB free on `/var`, swap disabled, UFW inactive, and HTTP 200 from `get.k3s.io`.
+
+**Not completed:** The K3s installation and three-member etcd cluster. Do not confuse OS provisioning with Kubernetes readiness.
 
 ## Troubleshooting and lessons learned
 
@@ -45,9 +48,11 @@ This project documents the design and implementation of a self-managed Kubernete
 
 **ACL preservation:** `rsync -aHAX` over guestmount reported `set_acl: Invalid argument` for systemd journal paths. Using direct ext4 mounts via qemu-nbd allowed the transfer to complete without reported errors. This illustrates the need to preserve ACLs, xattrs, ownership and hard links during system-directory migration.
 
-**Idempotency:** Repeating `tee -a` appended a duplicate `/var` entry to `fstab`. It was removed and verified; future provisioning will use a repeatable configuration procedure.
+**Idempotency:** Repeating `tee -a` appended a duplicate `/var` entry to node01 `fstab`. It was removed. The new `prepare-var-disk.sh` performs safety checks but is **initial-provisioning-only**, not a fully idempotent script. Do not rerun on prepared disks.
 
 **Disk safety:** QCOW2 images must not be edited simultaneously by the guest and the host. The guest was shut down and filesystems unmounted before block-device access. Disk identifiers were checked before formatting.
+
+**Transient unmount failure:** On node02, copying and fstab updates completed but cleanup returned `target is busy`; after inspection, manual unmount and NBD disconnect succeeded. On node03, bounded retry succeeded on the third unmount attempt. Exact root cause was not established.
 
 ## Validation commands
 
@@ -67,8 +72,7 @@ systemctl --failed
 
 ## Next milestones
 
-- Automate VM creation and `/var` preparation for `k3s-node02` and `k3s-node03` with unique identities.
-- Validate NTP, DNS, network connectivity, resource headroom, and the selected K3s version.
+- Validate NTP/time, DNS, Kubernetes-required port connectivity and the selected pinned K3s version.
 - Deploy K3s with embedded etcd and establish a stable Kubernetes API endpoint.
 - Deploy MongoDB 8.0.13 using a suitable Bitnami Helm chart, with explicit resource constraints and exporter metrics.
 - Deploy Argo CD, then build the application's Docker image and Helm chart.
@@ -76,7 +80,7 @@ systemctl --failed
 
 ## Documentation
 
-The detailed Hebrew step-by-step infrastructure runbook, including executed commands and observed outputs, is located at:
+The updated Hebrew step-by-step infrastructure runbook, including the three VMs, provisioning scripts, troubleshooting, and verified preflight results, is located at:
 
 [`docs/01-infrastructure-setup-he.md`](docs/01-infrastructure-setup-he.md)
 

@@ -1,6 +1,6 @@
-# Targil2026 — תיעוד הקמת תשתית KVM ושרת Kubernetes ראשון
+# Targil2026 — תיעוד תשתית KVM לשלושה שרתי Kubernetes
 
-> **מצב הפרויקט:** המכונה `k3s-node01` הוקמה ונבדקה; **K3s, MongoDB, Argo CD והאפליקציה טרם הותקנו**. המסמך מתעד את העבודה שבוצעה בפועל ואת ההחלטות שהתקבלו. 
+> **מצב הפרויקט:** שלוש מכונות Ubuntu (`k3s-node01`, `k3s-node02`, `k3s-node03`) הוקמו ונבדקו. **K3s, MongoDB, Argo CD והאפליקציה טרם הותקנו**. המסמך מתעד את הפעולות שאושרו בפועל ומפריד בינן לבין שלבים מתוכננים. 
 >
 > **תאריך תיעוד:** 18 בנובמבר 2026. **סביבה:** מעבדת Ubuntu מקומית על מחשב נייד.
 
@@ -8,7 +8,7 @@
 
 להקים סביבת Kubernetes לא־מנוהלת, לפרוס MongoDB ואפליקציה באמצעות Helm, להפעיל Argo CD ולבנות תהליך CI/CD עם בדיקות אבטחה. התהליך יתבצע בשלבים, וכל שלב יכלול **מטרה, הסבר, החלטת תכן, פקודות, בדיקות, תקלות ולקחים**.
 
-המסמך הנוכחי מכסה רק את **הקמת בסיס הווירטואליזציה והמכונה הראשונה**.
+המסמך מכסה את **הקמת תשתית הווירטואליזציה ושלושת שרתי Ubuntu**, את האוטומציה שהוספנו, ואת הבדיקות לפני K3s.
 
 ## 2. סביבת העבודה והסייזינג
 
@@ -25,14 +25,14 @@
 | Hypervisor | KVM + QEMU 8.2.2 |
 | כלי ניהול | libvirt/virsh 10.0.0, `virt-install`, `virt-manager` |
 
-### תכנון מעבדת שלושת השרתים
+### תצורת מעבדת שלושת השרתים — הוקמה בפועל
 
-| VM | vCPU | RAM | דיסק OS | דיסק `/var` | IP מתוכנן |
+| VM | vCPU | RAM | דיסק OS | דיסק `/var` | IP |
 |---|---:|---:|---:|---:|---|
 | `k3s-node01` | 2 | 5 GiB | 25 GiB | 55 GiB | `192.168.122.11` |
 | `k3s-node02` | 2 | 5 GiB | 25 GiB | 55 GiB | `192.168.122.12` |
 | `k3s-node03` | 2 | 5 GiB | 25 GiB | 55 GiB | `192.168.122.13` |
-| **סה"כ מתוכנן** | **6 vCPU** | **15 GiB** | **75 GiB** | **165 GiB** | |
+| **סה"כ לוגי** | **6 vCPU** | **15 GiB** | **75 GiB** | **165 GiB** | |
 
 **החלטה:** K3s עם שלושה שרתים, כשכל שרת מתוכנן לתפקידי Control Plane + embedded etcd + Worker. בחרנו בשלושה שרתים כדי ללמוד quorum, scheduling והתנהגות מול כשלי Node, למרות מגבלת המשאבים במחשב הנייד. נפחי QCOW2 הם **גבולות לוגיים** ולא נפח פיזי שמוקצה כולו מיד. יש לנטר את המקום הפנוי במארח.
 
@@ -437,6 +437,150 @@ systemctl --failed
 
 **אסטרטגיית Rollback:** נשמרו `/var` המקורי בדיסק OS וגיבוי `fstab.bak`. אם ה־VM אינה עולה, יש לכבותה ולשחזר את ההגדרה דרך כלי תחזוקה מתאימים; אין להפעילה כשדיסקיה מחוברים בכתיבה למארח.
 
+## 11א. אוטומציה להקמת node02 ו־node03
+
+לאחר יצירת `k3s-node01` ידנית יחסית, עברנו לתהליך חוזר באמצעות הסקריפטים:
+
+```text
+infrastructure/kvm/
+├── cloud-init/
+│   ├── user-data.yaml
+│   ├── node02-user-data.yaml
+│   └── node03-user-data.yaml
+└── scripts/
+    ├── create-vm-disks.sh
+    ├── prepare-var-disk.sh
+    └── prepare-var-disk.sh.bak   # גיבוי מקומי; אין צורך להעלות ל־Git
+```
+
+### יצירת זהות ייחודית וכתובות שמורות
+
+לקובצי ה־Cloud-init הוגדרו `hostname: k3s-node02` ו־`hostname: k3s-node03`, המשתמש `zohargo`, ו־`ssh_authorized_keys`. לא פורסם המפתח הפרטי.
+
+הוספו/אומתו רשומות DHCP ברשת `default` של libvirt:
+
+```bash
+virsh -c qemu:///system net-update default add ip-dhcp-host \
+  "<host mac='52:54:00:26:00:12' name='k3s-node02' ip='192.168.122.12'/>" \
+  --live --config
+virsh -c qemu:///system net-update default add ip-dhcp-host \
+  "<host mac='52:54:00:26:00:13' name='k3s-node03' ip='192.168.122.13'/>" \
+  --live --config
+```
+
+> הפקודות לעיל הן תיעוד ההגדרה; **אין להריץ `net-update add` שוב** אם הרשומות כבר קיימות. בדיקה בטוחה: `virsh -c qemu:///system net-dumpxml default`.
+
+### יצירת דיסקים: `create-vm-disks.sh`
+
+```bash
+cd ~/targil2026
+./infrastructure/kvm/scripts/create-vm-disks.sh k3s-node02
+./infrastructure/kvm/scripts/create-vm-disks.sh k3s-node03
+```
+
+הסקריפט מקבל רק שמות `k3s-node02` או `k3s-node03`, דורש שתמונת הבסיס קיימת וששמות הדיסקים וה־VM עדיין אינם בשימוש, מעתיק תמונת Ubuntu, מגדיל את דיסק ה־OS ל־25GiB ויוצר QCOW2 ריק בגודל 55GiB עבור `/var`.
+
+**נצפה:** לשני השרתים דיסק OS בגודל לוגי 25GiB ובנפח פיזי ראשוני כ־593MiB, ודיסק VAR לוגי 55GiB ובנפח פיזי ראשוני כ־196KiB; בשניהם `corrupt: false` לפי `qemu-img info`.
+
+### הכנת דיסק `/var`: `prepare-var-disk.sh`
+
+```bash
+# דוגמה להפעלה ראשונית בלבד — הפקודות כבר הורצו בהצלחה ואין להריצן שוב!
+sudo ./infrastructure/kvm/scripts/prepare-var-disk.sh k3s-node02
+sudo ./infrastructure/kvm/scripts/prepare-var-disk.sh k3s-node03
+```
+
+הסקריפט מאמת ששם המכונה מותר, שה־VM אינה קיימת ב־libvirt, ושהתקני NBD פנויים. הוא מחבר את דיסק OS ל־`/dev/nbd0` ואת דיסק VAR ל־`/dev/nbd1`, מזהה מחיצת Root ב־`/dev/nbd0p1`, מוודא שדיסק הנתונים ללא חתימות ומחיצות, יוצר ext4, ומעתיק את התוכן המקורי של `/var` באמצעות:
+
+```bash
+rsync -aHAX --numeric-ids --one-file-system SOURCE/var/ TARGET/
+rsync -aHAXnc --numeric-ids --one-file-system --itemize-changes SOURCE/var/ TARGET/
+```
+
+לאחר אימות פלט ריק בבדיקת ההשוואה, הוא מגבה את `fstab` ומוסיף רשומת `/var` באמצעות UUID. ב־node02 וב־node03 זוהתה רשומה אחת עם ה־UUID הנכון בעזרת `virt-cat`, ללא הפעלת המכונה.
+
+**זהירות:** `mkfs.ext4` הוא הרסני. הסקריפט מיועד לדיסקים חדשים בלבד; הוא **אינו** תהליך Idempotent מלא, ו**אסור להריצו פעם נוספת** על דיסק `/var` שכבר הוכן. הבדיקות האוטומטיות מצמצמות סיכון, אך אינן מחליפות גיבוי ואימות זהות הדיסק.
+
+### Troubleshooting — `umount: target is busy`
+
+ב־node02 ההעתקה ואימות `rsync` הצליחו, ו־`fstab` עודכן, אך ה־Cleanup נכשל בניסיון ניתוק דיסק VAR:
+
+```text
+umount: /mnt/targil-var.3Mq6HA: target is busy
+ERROR: A filesystem is still mounted.
+NBD devices were not disconnected.
+```
+
+`fuser -vm` הציג רק `root kernel mount`, ללא תהליך משתמש שזוהה. בוצע `sudo umount` רגיל בהצלחה, ואז נותקו `/dev/nbd1` ו־`/dev/nbd0`. אומת ששניהם חזרו לגודל `0B` ב־`lsblk`. **שורש התקלה המדויק לא זוהה**; אין לפרש `kernel mount` כהוכחה לקיומו של תהליך שחוסם את הניתוק.
+
+לקראת node03 גובתה גרסת הסקריפט ונוספה פונקציית `safe_umount` עם עד חמישה ניסיונות ניתוק והשהיית שתי שניות ביניהם, ללא ניתוק כפוי. `bash -n` עבר והפונקציה הופיעה בהגדרה ובשתי קריאות Cleanup.
+
+ב־node03 נרשמו שני כישלונות זמניים ולאחריהם הצלחה בניסיון השלישי:
+
+```text
+Unmount attempt 1 failed
+Unmount attempt 2 failed
+Unmount successful: /mnt/targil-var.UTDiPS
+Unmount successful: /mnt/targil-os.b1w9Vw
+/dev/nbd1 disconnected
+/dev/nbd0 disconnected
+Preparation completed successfully.
+Exit code: 0
+```
+
+בדיקת `lsblk` הראתה `nbd0 0B` ו־`nbd1 0B`. **לקח:** `trap` מועיל לניקוי, אך כשל `umount` זמני עשוי לדרוש Retry מוגבל ובדיקת הניתוק בפועל. אין להשתמש ב־`umount -f`, ‏`umount -l` או בניתוק NBD כשהמערכת עדיין מחוברת.
+
+### יצירת המכונות עם virt-install
+
+```bash
+# דוגמה — node03, בוצע כבר. אין להריץ על VM קיימת.
+virt-install \
+  --connect qemu:///system \
+  --name k3s-node03 \
+  --memory 5120 \
+  --vcpus 2 \
+  --os-variant ubuntu24.04 \
+  --import \
+  --disk path=/var/lib/libvirt/images/k3s-node03.qcow2,format=qcow2,bus=virtio \
+  --disk path=/var/lib/libvirt/images/k3s-node03-var.qcow2,format=qcow2,bus=virtio \
+  --network network=default,model=virtio,mac=52:54:00:26:00:13 \
+  --cloud-init user-data=$HOME/targil2026/infrastructure/kvm/cloud-init/node03-user-data.yaml \
+  --graphics none \
+  --console pty,target_type=serial \
+  --noautoconsole
+```
+
+ה־VMs קיבלו כתובות `.12` ו־`.13` והתחברנו אליהן ב־SSH. Cloud-init השלים `status: done`, ‏`errors: []`. בשתי המכונות `/var` מותקן על `/dev/vdb` מסוג ext4, מערכת הקבצים מדווחת על נפח 54GiB ושימוש התחלתי של כ־1%, מחיצת Root גדלה אוטומטית, ו־`systemctl --failed` הציג 0 יחידות כושלות.
+
+## 11ב. בדיקות רשת ומוכנות ל־K3s
+
+### בדיקות על node03 — בוצעו
+
+```bash
+ping -c 3 192.168.122.11
+ping -c 3 192.168.122.12
+systemctl is-active ssh
+ip -br addr
+ip route
+```
+
+**תוצאות:** שתי בדיקות ה־Ping החזירו `3 transmitted, 3 received, 0% packet loss`; זמני תגובה ממוצעים כ־0.529ms ל־node01 וכ־0.830ms ל־node02; `ssh=active`; כתובת `enp1s0` היא `192.168.122.13/24`; שער ברירת המחדל `192.168.122.1`. בדיקת ICMP אינה מחליפה בדיקת פורטים TCP/UDP.
+
+### בדיקות על node01 — בוצעו
+
+```bash
+hostname
+free -h
+df -h /var
+swapon --show
+sudo ufw status
+curl -I --connect-timeout 5 https://get.k3s.io
+```
+
+**תוצאות:** `k3s-node01`; סך זיכרון 4.8GiB, כ־4.4GiB זמינים בזמן הבדיקה; `/var` בגודל 54GiB, כ־51GiB פנויים; Swap ‏0B; `ufw: inactive`; אתר `https://get.k3s.io` השיב HTTP/2 200. אין עדיין אישור להורדת קובצי ההתקנה והתמונות הדרושות.
+
+**תכנון K3s הבא:** שלושה `server` nodes עם embedded etcd (כל אחד גם Worker). סדר הצירוף: node01 עם `cluster-init`, אחריו node02 ו־node03. צירוף של שלושה שרתי etcd יספק quorum של שניים מתוך שלושה, אך לא יתירות בפני כשל של המחשב המארח היחיד. מומלץ לקבע גרסת K3s ולאשר שעון/NTP לפני ההתקנה.
+
 ## 12. החלטות התכן — סיכום
 
 | החלטה | נימוק | הסתייגות |
@@ -452,20 +596,34 @@ systemctl --failed
 | rsync + NBD | שמירת ACL/XATTR לאחר כשל FUSE | NBD מחייב בדיקות בטיחות |
 | UUID ב־fstab | Mount יציב גם אם שם ההתקן משתנה | יש לבדוק תקינות אחרי reboot |
 
-## 13. מצב נוכחי ומשימות להמשך
+## 13. מצב נוכחי ומשימות להמשך — 18.11.2026
 
-**הושלם:** `k3s-node01` עם Ubuntu 24.04, כתובת `192.168.122.11`, SSH, Cloud-init, דיסק OS ‏25 GiB ודיסק `/var` ‏55 GiB; המשתמש אישר עלייה תקינה ושירותים תקינים לאחר העברת `/var`.
+**הושלם:** הקמת שלוש מכונות Ubuntu 24.04 עם 2 vCPU, ‏5120MiB RAM, דיסק OS ‏25GiB, ודיסק ext4 ייעודי ‏55GiB המותקן על `/var`. הוגדרו שמות ייחודיים וכתובות IP קבועות באמצעות DHCP Reservations. נבדקו Cloud-init, אחסון ותקשורת. **לא הותקן K3s עדיין.**
 
-**טרם בוצע:** יצירה והקשחה בסיסית/בדיקת זמן של `k3s-node02` ו־`k3s-node03`; קיבוע גרסאות K3s; הקמת cluster עם embedded etcd; התקנת Helm; Argo CD; MongoDB 8.0.13; אפליקציה; CI/CD ו־GitOps.
+| מכונה | IP | MAC | דיסק `/var` | תוצאה מאומתת |
+|---|---|---|---|---|
+| `k3s-node01` | `192.168.122.11` | `52:54:00:26:00:11` | `78158383-0fcd-4c5f-9e4c-30dacb80cbcf` | פעילה, אחסון נבדק; מוכנות ראשונית ל־K3s נבדקה |
+| `k3s-node02` | `192.168.122.12` | `52:54:00:26:00:12` | `59b0ccac-a854-4753-a763-dba4b4a66adf` | SSH תקין, Cloud-init `done`, `/var` על `vdb`, 0 יחידות systemd שנכשלו |
+| `k3s-node03` | `192.168.122.13` | `52:54:00:26:00:13` | `87e88eec-efc2-4999-9a97-4f444b7656cc` | Cloud-init `done`, `/var` על `vdb`, 0 יחידות systemd שנכשלו, רשת נבדקה |
 
-### צעדי ההמשך המומלצים
+### בדיקות מוכנות שכבר בוצעו בשרת הראשון
 
-1. להפוך את יצירת ה־VMs והגדרת `/var` לסקריפט משוחזר/Cloud-init, ולא לחזור על מיגרציה ידנית של `/var` לכל VM.
-2. ליצור לכל VM **זהות ייחודית** (hostname, MAC, machine-id, SSH host keys) ודיסקים עצמאיים מתמונת המקור.
-3. להגדיר DHCP Reservations ל־`.12` ול־`.13`, אחרי בדיקת התנגשויות.
-4. לוודא `timedatectl`, DNS ויציאה לאינטרנט בכל שלוש המכונות.
-5. לבדוק זמינות משאבי מארח ו־VMs לפני התקנת K3s.
-6. לאחר מכן להתחיל התקנת K3s בשלבים עם אימות Node ו־etcd quorum.
+```bash
+hostname
+free -h
+df -h /var
+swapon --show
+sudo ufw status
+curl -I --connect-timeout 5 https://get.k3s.io
+```
+
+**נצפה בפועל:** `hostname=k3s-node01`; זיכרון כולל 4.8GiB וזמין 4.4GiB; דיסק `/var` בגודל מערכת קבצים 54GiB, מתוכם כ־51GiB פנויים; ללא Swap; `ufw` לא פעיל; `get.k3s.io` החזיר HTTP/2 200. בדיקת `curl -I` אינה מבטיחה זמינות של כל קובצי הבינארי/Images הנחוצים להתקנה.
+
+**בדיקות שנותרו לפני/במהלך התקנת K3s:** לוודא `timedatectl` ו־NTP, DNS ותקשורת TCP בפורטים הרלוונטיים; לבדוק גרסה זמינה של K3s ולבחור גרסה קבועה; לתכנן Kubernetes API endpoint יציב לפי צורך.
+
+**שלב הבא (טרם בוצע):** אתחול `k3s-node01` כשרת K3s ראשון עם embedded etcd, אימות `kubectl`, ולאחר מכן צירוף node02 ו־node03 כשרתי Server. רק אחרי הצטרפות שלושתם יתקיים etcd quorum של 2 מתוך 3. שלוש ה־VMs פועלות על מחשב מארח יחיד, ולכן אין עמידות לכשל במחשב המארח.
+
+**שלבים מאוחרים יותר (טרם בוצעו):** Helm, ‏MongoDB 8.0.13, ‏Argo CD, אפליקציית התרגיל, GitHub Actions, ‏SAST, ‏Trivy ו־GitOps.
 
 ## 14. פקודות בדיקה מהירה
 
