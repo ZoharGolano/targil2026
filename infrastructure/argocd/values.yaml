@@ -1,0 +1,29 @@
+# Targil2026 - Argo CD configuration
+# Helm chart: argo/argo-cd
+# Chart version: 10.18.2
+
+global:
+  domain: argocd.local
+
+controller:
+  replicas: 1
+
+server:
+  replicas: 1
+  service:
+    type: ClusterIP
+
+repoServer:
+  replicas: 1
+
+applicationSet:
+  enabled: false
+
+notifications:
+  enabled: false
+
+dex:
+  enabled: false
+
+redis-ha:
+  enabled: false
