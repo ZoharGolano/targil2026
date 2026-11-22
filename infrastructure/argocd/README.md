@@ -170,3 +170,218 @@ kubectl get events -n argocd --sort-by=.lastTimestamp
 - Application container images are scanned with Trivy before publication.
 - Administrator credentials must not be committed to Git.
 - Kubernetes RBAC and GitHub permissions should follow the principle of least privilege.
+
+
+
+
+## Permanent HTTPS Access Through Traefik
+
+### Overview
+
+Argo CD is accessible through a dedicated Traefik Ingress using the hostname:
+
+`https://argocd.test`
+
+This configuration replaces the need for manually running Kubernetes port forwarding.
+
+The endpoint is intended for access from the local lab environment.
+
+### Environment
+
+| Component | Configuration |
+|---|---|
+| Argo CD | v3.6.2 |
+| Helm chart | argo-cd 10.18.2 |
+| Helm release revision | 2 |
+| Namespace | argocd |
+| Ingress controller | Traefik |
+| Hostname | argocd.test |
+| HTTPS port | 443 |
+| TLS termination | Traefik |
+| Backend service | argocd-server |
+| Backend port | 80 |
+| TLS Secret | argocd-server-tls |
+
+### Architecture
+
+```text
+Ubuntu Host
+    |
+    | HTTPS :443
+    v
+Traefik Ingress
+    |
+    | TLS termination
+    v
+argocd-server:80
+    |
+    v
+Argo CD Web UI
+```
+
+The browser-to-Traefik connection is encrypted using HTTPS.
+
+Traefik forwards requests to the Argo CD server using HTTP within the Kubernetes cluster.
+
+This configuration is intended for the local lab, not for an internet-facing production environment.
+
+### Helm Configuration
+
+The Argo CD configuration is maintained in:
+
+`infrastructure/argocd/values.yaml`
+
+The relevant settings are:
+
+```yaml
+global:
+  domain: argocd.test
+
+configs:
+  params:
+    server.insecure: "true"
+
+server:
+  service:
+    type: ClusterIP
+
+  ingress:
+    enabled: true
+    controller: generic
+    ingressClassName: traefik
+    hostname: argocd.test
+    path: /
+    pathType: Prefix
+    tls: true
+    annotations:
+      traefik.ingress.kubernetes.io/router.entrypoints: websecure
+```
+
+### TLS Certificate
+
+A self-signed certificate was created for `argocd.test`.
+
+The certificate and private key are stored outside the Git repository:
+
+```text
+~/targil2026-tls/argocd.crt
+~/targil2026-tls/argocd.key
+```
+
+The Kubernetes TLS Secret was created using:
+
+```bash
+kubectl create secret tls argocd-server-tls \
+  --namespace argocd \
+  --cert="$HOME/targil2026-tls/argocd.crt" \
+  --key="$HOME/targil2026-tls/argocd.key"
+```
+
+When recreating an existing Secret, use a controlled update procedure.
+
+**Security:** Never commit TLS private keys or Kubernetes Secret values to Git.
+
+### Helm Upgrade
+
+The existing Argo CD installation was updated using:
+
+```bash
+helm upgrade argocd argo/argo-cd \
+  --version 10.18.2 \
+  --namespace argocd \
+  -f infrastructure/argocd/values.yaml \
+  --wait \
+  --timeout 10m
+```
+
+The upgrade completed successfully with Helm release revision 2.
+
+### Local Hostname Resolution
+
+The Ubuntu host uses the following `/etc/hosts` entry:
+
+```text
+192.168.122.11 argocd.test
+```
+
+Verify hostname resolution:
+
+```bash
+getent hosts argocd.test
+```
+
+### Validation
+
+Verify the Helm release:
+
+```bash
+helm list -n argocd
+```
+
+Verify the running Pods:
+
+```bash
+kubectl get pods -n argocd
+```
+
+Verify the Ingress:
+
+```bash
+kubectl get ingress -n argocd
+```
+
+Verify HTTPS connectivity:
+
+```bash
+curl -k -I https://argocd.test
+```
+
+Observed result:
+
+```text
+HTTP/2 200
+```
+
+The `-k` option skips certificate verification and is used here only for testing the self-signed lab certificate.
+
+### Access
+
+Open the following URL from the Ubuntu host:
+
+`https://argocd.test`
+
+Sign in using the configured Argo CD credentials.
+
+A browser security warning may appear because the certificate is self-signed.
+
+### Troubleshooting
+
+**HTTP 404:** Verify that the hostname matches the Ingress rule.
+
+**HTTP 502:** Verify that `argocd-server` is running and that the Ingress backend uses port 80.
+
+**TLS warning:** Verify that the certificate includes `argocd.test` in its Subject Alternative Names.
+
+**Name resolution failure:** Verify the local `/etc/hosts` entry.
+
+### Lessons Learned
+
+During configuration, Helm validation initially failed because `configs` was incorrectly defined as a YAML list rather than a mapping.
+
+Incorrect:
+
+```yaml
+configs:
+  - params:
+      server.insecure: true
+```
+
+Correct:
+
+```yaml
+configs:
+  params:
+    server.insecure: "true"
+```
+
+After correcting the YAML structure, Helm lint and template rendering succeeded.
